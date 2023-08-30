@@ -1,55 +1,222 @@
 package main
 
 import (
-	"github.com/gin-gonic/gin"
+	"fmt"
+	"context"
+	"errors"
+	"log"
+
 	"net/http"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/gin-gonic/gin"
 )
 
-type album struct {
-	ID     string  `json:"id"`
-	Title  string  `json:"title"`
-	Artist string  `json:"artist"`
-	Price  float64 `json:"price"`
+type Keyboard struct {
+	Id   string `json:"id"`
+	Name string `json:"name"`
 }
 
-var albums = []album{
-	{ID: "1", Title: "Blue Train", Artist: "John Coltrane", Price: 56.99},
-	{ID: "2", Title: "Jeru", Artist: "Gerry Mulligan", Price: 17.99},
-	{ID: "3", Title: "Sarah Vaughan and Clifford Brown", Artist: "Sarah Vaughan", Price: 39.99},
-}
-
-func getAlbums(c *gin.Context) {
-	c.IndentedJSON(http.StatusOK, albums)
-}
-
-func postAlbums(c *gin.Context) {
-	var newAlbum album
-
-	if err := c.BindJSON(&newAlbum); err != nil {
-		return
+func (kb Keyboard) GetKey() map[string]types.AttributeValue {
+	id, err := attributevalue.Marshal(kb.Id)
+	if err != nil {
+		log.Fatal(err)
 	}
-
-	albums = append(albums, newAlbum)
-	c.IndentedJSON(http.StatusCreated, newAlbum)
+	name, err := attributevalue.Marshal(kb.Name)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return map[string]types.AttributeValue{
+		"id":   id,
+		"name": name,
+	}
 }
 
-func getAlbumByID(c *gin.Context) {
-	id := c.Param("id")
+type TableBasics struct {
+	DynamoDbClient *dynamodb.Client
+	TableName      string
+}
 
-	for _, a := range albums {
-		if a.ID == id {
-			c.IndentedJSON(http.StatusOK, a)
-			return
+func (basics TableBasics) TableExists() (bool, error) {
+	exists := true
+	_, err := basics.DynamoDbClient.DescribeTable(
+		context.TODO(), &dynamodb.DescribeTableInput{TableName: aws.String(basics.TableName)},
+	)
+	if err != nil {
+		var notFoundEx *types.ResourceNotFoundException
+		if errors.As(err, &notFoundEx) {
+			log.Printf("Table %v does not exist.\n", basics.TableName)
+		} else {
+			log.Printf("Couldn't determine existence of table %v. Here's why: %v\n", basics.TableName, err)
+		}
+		exists = false
+	}
+	return exists, err
+}
+
+func (basics TableBasics) ListTables() ([]string, error) {
+	var tableNames []string
+	tables, err := basics.DynamoDbClient.ListTables(
+		context.TODO(), &dynamodb.ListTablesInput{},
+	)
+	if err != nil {
+		log.Fatal(err)
+	} else {
+		tableNames = tables.TableNames
+	}
+	return tableNames, err
+}
+
+func (basics TableBasics) CreateKeyboardTable() (*types.TableDescription, error) {
+	var tableDesc *types.TableDescription
+	table, err := basics.DynamoDbClient.CreateTable(context.TODO(), &dynamodb.CreateTableInput{
+		AttributeDefinitions: []types.AttributeDefinition{{
+			AttributeName: aws.String("id"),
+			AttributeType: types.ScalarAttributeTypeN,
+		}, {
+			AttributeName: aws.String("name"),
+			AttributeType: types.ScalarAttributeTypeS,
+		}},
+		KeySchema: []types.KeySchemaElement{{
+			AttributeName: aws.String("id"),
+			KeyType:       types.KeyTypeHash,
+		}, {
+			AttributeName: aws.String("name"),
+			KeyType:       types.KeyTypeRange,
+		}},
+		TableName: aws.String(basics.TableName),
+		ProvisionedThroughput: &types.ProvisionedThroughput{
+			ReadCapacityUnits:  aws.Int64(5),
+			WriteCapacityUnits: aws.Int64(5),
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	} else {
+		waiter := dynamodb.NewTableExistsWaiter(basics.DynamoDbClient)
+		err = waiter.Wait(context.TODO(), &dynamodb.DescribeTableInput{
+			TableName: aws.String(basics.TableName),
+		}, 5*time.Minute)
+		if err != nil {
+			log.Fatal(err)
+		}
+		tableDesc = table.TableDescription
+	}
+	return tableDesc, err
+}
+
+func (basics TableBasics) GetKeyboardByID(id string) (Keyboard, error) {
+	keyboard := Keyboard{Id: id}
+	response, err := basics.DynamoDbClient.GetItem(context.TODO(), &dynamodb.GetItemInput{
+		Key: keyboard.GetKey(), TableName: aws.String(basics.TableName),
+	})
+	if err != nil {
+		log.Fatal(err)
+	} else {
+		err = attributevalue.UnmarshalMap(response.Item, &keyboard)
+		if err != nil {
+			log.Fatal(err)
 		}
 	}
-	c.IndentedJSON(http.StatusNotFound, gin.H{"message": "album not found"})
+	return keyboard, err
+
+}
+
+func (basics TableBasics) AddKeyboard(keyboard Keyboard) error {
+	item, err := attributevalue.MarshalMap(keyboard)
+	if err != nil {
+		log.Fatal(err)
+	}
+	_, err = basics.DynamoDbClient.PutItem(context.TODO(), &dynamodb.PutItemInput{
+		TableName: aws.String(basics.TableName), Item: item,
+	})
+	if err != nil {
+		log.Printf("Couldn't add item to table. Here's why: %v\n", err)
+	}
+	return err
+}
+
+func (basics TableBasics) Scan() ([]Keyboard, error) {
+	var keyboards []Keyboard
+	var err error
+	var response *dynamodb.ScanOutput
+	projEx := expression.NamesList(
+		expression.Name("id"),
+		expression.Name("name"),
+	)
+	expr, err := expression.NewBuilder().WithProjection(projEx).Build()
+	if err != nil {
+		log.Printf("Couldn't build expressions for scan. Here's why: %v\n", err)
+	} else {
+		response, err = basics.DynamoDbClient.Scan(context.TODO(), &dynamodb.ScanInput{
+			TableName:                 aws.String(basics.TableName),
+			ExpressionAttributeNames:  expr.Names(),
+			ExpressionAttributeValues: expr.Values(),
+			FilterExpression:          expr.Filter(),
+			ProjectionExpression:      expr.Projection(),
+		})
+		if err != nil {
+			log.Printf("Couldn't scan for keyboards. Here's why: %v\n", err)
+		} else {
+			err = attributevalue.UnmarshalListOfMaps(response.Items, &keyboards)
+			if err != nil {
+				log.Printf("Could't unmarshal query response. Here's why: %v\n", err)
+			}
+		}
+	}
+	return keyboards, err
+}
+
+func (basics TableBasics) GetKeyboardsHandler(c *gin.Context) {
+	keyboards, err := basics.Scan()
+	if err != nil {
+		log.Fatal(err)
+	}
+	c.IndentedJSON(http.StatusOK, keyboards)
 }
 
 func main() {
-	router := gin.Default()
-	router.GET("/albums", getAlbums)
-	router.GET("/albums/:id", getAlbumByID)
-	router.POST("/albums", postAlbums)
+	config, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	dynamoClient := dynamodb.NewFromConfig(config)
+
+	keyboardTable := TableBasics{
+		DynamoDbClient: dynamoClient,
+		TableName:      "keebdb-keyboards",
+	}
+
+	exists, err := keyboardTable.TableExists()
+	if err != nil {
+		if !exists {
+			log.Printf("Table not found. Creating new one...\n")
+			_, err := keyboardTable.CreateKeyboardTable()
+			if err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			log.Fatal(err)
+		}
+	}
+	
+	keyboards, err := keyboardTable.Scan()
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(keyboards)
+
+	router := gin.New()
+	router.GET("/api/keyboards", keyboardTable.GetKeyboardsHandler)
+	// router.GET("/api/keyboards/:id", getKeyboardByID)
+	// router.POST("/api/keyboards", postKeyboard)
 
 	router.Run("localhost:8080")
 }
