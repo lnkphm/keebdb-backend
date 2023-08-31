@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"context"
 	"errors"
 	"log"
@@ -209,5 +210,9 @@ func main() {
 	router := gin.New()
 	router.GET("/api/keyboards", keyboardTable.GetKeyboardsHandler)
 
-	router.Run("127.0.0.1:5000")
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "5000"
+	}
+	router.Run(":"+port)
 }
