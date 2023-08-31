@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"context"
 	"errors"
 	"log"
@@ -206,17 +205,9 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-	
-	keyboards, err := keyboardTable.Scan()
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println(keyboards)
 
 	router := gin.New()
 	router.GET("/api/keyboards", keyboardTable.GetKeyboardsHandler)
-	// router.GET("/api/keyboards/:id", getKeyboardByID)
-	// router.POST("/api/keyboards", postKeyboard)
 
-	router.Run("localhost:8080")
+	router.Run("127.0.0.1:8080")
 }
